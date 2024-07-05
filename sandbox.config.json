@@ -1,11 +1,15 @@
 {
-    "template": "node",
-    "view": "preview",
+    "template": "python",
     "container": {
-      "port": 3000,
-      "startScript": "start"
+      "port": 8000,
+      "startScript": "python main.py"
     },
-    "node": "14",
     "hardReloadOnChange": true,
-    "openedFiles": ["README.md"]
+    "openedFiles": ["README.md"],
+    "setupTasks": [
+      {
+        "name": "Install Dependencies",
+        "command": "pip install -r requirements.txt"
+      }
+    ]
   }
