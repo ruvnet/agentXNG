@@ -1,0 +1,11 @@
+{
+    "template": "node",
+    "view": "preview",
+    "container": {
+      "port": 3000,
+      "startScript": "start"
+    },
+    "node": "14",
+    "hardReloadOnChange": true,
+    "openedFiles": ["README.md"]
+  }
