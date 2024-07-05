@@ -1,0 +1,8 @@
+colorama==0.4.6
+Pygments==2.15.1
+Pillow==9.5.0
+litellm==1.14.1
+requests==2.31.0
+tavily-python
+python-dotenv
+anthropic

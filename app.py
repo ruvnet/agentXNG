@@ -5,14 +5,16 @@ from colorama import init, Fore, Style
 from pygments import highlight
 from pygments.lexers import get_lexer_by_name
 from pygments.formatters import TerminalFormatter
+from tavily import TavilyClient
 import pygments.util
 import base64
 from PIL import Image
 import io
 import re
+from anthropic import Anthropic
 import difflib
-from litellm import completion
-import requests
+import textwrap
+import time
 
 # Initialize colorama
 init()
@@ -27,6 +29,12 @@ RESULT_COLOR = Fore.GREEN
 CONTINUATION_EXIT_PHRASE = "AUTOMODE_COMPLETE"
 MAX_CONTINUATION_ITERATIONS = 25
 
+# Initialize the Anthropic client
+client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+# Initialize the Tavily client
+tavily = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY"))
+
 # Set up the conversation memory
 conversation_history = []
 
@@ -35,7 +43,7 @@ automode = False
 
 # System prompt
 system_prompt = """
-You are an AI assistant powered by the Claude-3.5-Sonnet model. You are an exceptional software developer with vast knowledge across multiple programming languages, frameworks, and best practices. Your capabilities include:
+You are Claude, an AI assistant powered by Anthropic's Claude-3.5-Sonnet model. You are an exceptional software developer with vast knowledge across multiple programming languages, frameworks, and best practices. Your capabilities include:
 
 1. Creating project structures, including folders and files
 2. Writing clean, efficient, and well-documented code
@@ -69,7 +77,7 @@ You can now read files, list the contents of the root folder where this script i
 - You believe reading a file or listing directory contents will be beneficial to accomplish the user's goal
 - You need up-to-date information or additional context to answer a question accurately
 
-When you need current information or feel that a search could provide a better answer, use the searxng_search tool. This tool performs a web search and returns a concise answer along with relevant sources.
+When you need current information or feel that a search could provide a better answer, use the tavily_search tool. This tool performs a web search and returns a concise answer along with relevant sources.
 
 Always strive to provide the most accurate, helpful, and detailed responses possible. If you're unsure about something, admit it and consider using the search tool to find the most current information.
 
@@ -168,21 +176,10 @@ def list_files(path="."):
     except Exception as e:
         return f"Error listing files: {str(e)}"
 
-def searxng_search(query):
+def tavily_search(query):
     try:
-        searxng_url = os.environ.get('SEARXNG_URL', 'http://localhost:8888')
-        params = {
-            "q": query,
-            "format": "json"
-        }
-        response = requests.get(searxng_url, params=params)
-        results = response.json()
-        
-        formatted_results = []
-        for result in results.get("results", [])[:5]:  # Limit to top 5 results
-            formatted_results.append(f"Title: {result['title']}\nURL: {result['url']}\nSnippet: {result['content']}\n")
-        
-        return "\n".join(formatted_results) if formatted_results else "No results found."
+        response = tavily.qna_search(query=query, search_depth="advanced")
+        return response
     except Exception as e:
         return f"Error performing search: {str(e)}"
 
@@ -265,8 +262,8 @@ tools = [
         }
     },
     {
-        "name": "searxng_search",
-        "description": "Perform a web search using SearXNG API to get up-to-date information or additional context. Use this when you need current information or feel a search could provide a better answer.",
+        "name": "tavily_search",
+        "description": "Perform a web search using Tavily API to get up-to-date information or additional context. Use this when you need current information or feel a search could provide a better answer.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -291,8 +288,8 @@ def execute_tool(tool_name, tool_input):
         return read_file(tool_input["path"])
     elif tool_name == "list_files":
         return list_files(tool_input.get("path", "."))
-    elif tool_name == "searxng_search":
-        return searxng_search(tool_input["query"])
+    elif tool_name == "tavily_search":
+        return tavily_search(tool_input["query"])
     else:
         return f"Unknown tool: {tool_name}"
 
@@ -300,7 +297,7 @@ def encode_image_to_base64(image_path):
     try:
         with Image.open(image_path) as img:
             max_size = (1024, 1024)
-            img.thumbnail(max_size, Image.DEFAULT_STRATEGY)
+            img.thumbnail(max_size, Image.ANTIALIAS)
             if img.mode != 'RGB':
                 img = img.convert('RGB')
             img_byte_arr = io.BytesIO()
@@ -322,6 +319,9 @@ def execute_goals(goals):
             automode = False
             print_colored("Exiting automode.", TOOL_COLOR)
             break
+
+def format_text_for_cli(text, width=70):
+    return "\n".join(textwrap.wrap(text, width))
 
 def chat_with_claude(user_input, image_path=None, current_iteration=None, max_iterations=None):
     global conversation_history, automode
@@ -356,76 +356,86 @@ def chat_with_claude(user_input, image_path=None, current_iteration=None, max_it
     else:
         conversation_history.append({"role": "user", "content": user_input})
     
-    messages = [msg for msg in conversation_history if msg.get('content')]
-      try:
-        response = completion(
+    # Ensure that roles alternate between "user" and "assistant"
+    messages = []
+    for msg in conversation_history:
+        if msg.get('content'):
+            if len(messages) == 0 or messages[-1]['role'] != msg['role']:
+                messages.append(msg)
+            else:
+                # Merge consecutive user messages into one
+                messages[-1]['content'] += "\n" + msg['content']
+
+    try:
+        assistant_response = ""
+        with client.messages.stream(
             model="claude-3-5-sonnet-20240620",
-            messages=messages,
             max_tokens=4000,
-            temperature=0.7,
             system=update_system_prompt(current_iteration, max_iterations),
+            messages=messages,
             tools=tools,
             tool_choice={"type": "auto"}
-        )
+        ) as stream:
+            exit_continuation = False
+            
+            for event in stream:
+                if event.type == "text":
+                    # Print each character with a delay to simulate typing
+                    for char in event.text:
+                        print(char, end='', flush=True)
+                        time.sleep(0.01)
+                    assistant_response += event.text
+                    if CONTINUATION_EXIT_PHRASE in event.text:
+                        exit_continuation = True
+                        break
+                elif event.type == "tool_use":
+                    tool_name = event.name
+                    tool_input = event.input
+                    tool_use_id = event.id
+
+                    print_colored(f"\nTool Used: {tool_name}", TOOL_COLOR)
+                    print_colored(f"Tool Input: {tool_input}", TOOL_COLOR)
+
+                    result = execute_tool(tool_name, tool_input)
+                    print_colored(f"Tool Result: {result}", RESULT_COLOR)
+
+                    conversation_history.append({"role": "assistant", "content": [event]})
+                    conversation_history.append({
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_use_id,
+                                "content": result
+                            }
+                        ]
+                    })
+
+                    tool_response = client.messages.create(
+                        model="claude-3-5-sonnet-20240620",
+                        max_tokens=4000,
+                        system=update_system_prompt(current_iteration, max_iterations),
+                        messages=[msg for msg in conversation_history if msg.get('content')],
+                        tools=tools,
+                        tool_choice={"type": "auto"}
+                    )
+
+                    for tool_content_block in tool_response.content:
+                        if tool_content_block.type == "text":
+                            for char in tool_content_block.text:
+                                print(char, end='', flush=True)
+                                time.sleep(0.01)
+                            assistant_response += tool_content_block.text
+            
     except Exception as e:
         print_colored(f"Error calling Claude API: {str(e)}", TOOL_COLOR)
         return "I'm sorry, there was an error communicating with the AI. Please try again.", False
     
-    assistant_response = ""
-    exit_continuation = False
-    
-    for content_block in response.content:
-        if content_block.type == "text":
-            assistant_response += content_block.text
-            print_colored(f"\nClaude: {content_block.text}", CLAUDE_COLOR)
-            if CONTINUATION_EXIT_PHRASE in content_block.text:
-                exit_continuation = True
-        elif content_block.type == "tool_use":
-            tool_name = content_block.name
-            tool_input = content_block.input
-            tool_use_id = content_block.id
-            
-            print_colored(f"\nTool Used: {tool_name}", TOOL_COLOR)
-            print_colored(f"Tool Input: {tool_input}", TOOL_COLOR)
-            
-            result = execute_tool(tool_name, tool_input)
-            print_colored(f"Tool Result: {result}", RESULT_COLOR)
-            
-            conversation_history.append({"role": "assistant", "content": [content_block]})
-            conversation_history.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_use_id,
-                        "content": result
-                    }
-                ]
-            })
-            
-            try:
-                tool_response = completion(
-                    model="claude-3-5-sonnet-20240620",
-                    messages=[msg for msg in conversation_history if msg.get('content')],
-                    max_tokens=4000,
-                    temperature=0.7,
-                    system=update_system_prompt(current_iteration, max_iterations),
-                    tools=tools,
-                    tool_choice={"type": "auto"}
-                )
-                
-                for tool_content_block in tool_response.content:
-                    if tool_content_block.type == "text":
-                        assistant_response += tool_content_block.text
-                        print_colored(f"\nClaude: {tool_content_block.text}", CLAUDE_COLOR)
-            except Exception as e:
-                print_colored(f"Error in tool response: {str(e)}", TOOL_COLOR)
-                assistant_response += "\nI encountered an error while processing the tool result. Please try again."
-    
     if assistant_response:
-        conversation_history.append({"role": "assistant", "content": assistant_response})
+        conversation_history.append({"role": "assistant", "content": assistant_response.strip()})
     
-    return assistant_response, exit_continuation
+    return "", exit_continuation  # Return empty string to avoid reprinting the response
+
 
 def process_and_display_response(response):
     if response.startswith("Error") or response.startswith("I'm sorry"):
